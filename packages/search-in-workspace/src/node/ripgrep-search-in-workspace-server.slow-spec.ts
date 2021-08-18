@@ -948,119 +948,409 @@ describe('ripgrep-search-in-workspace-server', function (): void {
     });
 });
 
+describe('#normalizePath', function (): void {
+    this.timeout(10000);
+    it('should clean up path formatting', function (): void {
+        const paths = [
+            '',
+            '/',
+            '.',
+            '..',
+            '././.',
+            '\r\n./../..',
+            ' /..////.././   ',
+            '/absolute/**/path/*/',
+            './explicit/*/relative/path/**',
+            '\timplicit',
+            'internal/removable/../elements/./../',
+            'C:\\absolute\\windows\\path\\',
+            '..\\explicit\\windows\\path',
+            'implicit\\\\windows\\*\\path\\..\n',
+            'with spaces/inside the/path'
+        ];
+        const normalizedPaths = paths.map(ripgrepServer['normalizePath']);
+        expect(normalizedPaths).deep.equals([
+            '',
+            '/',
+            '.',
+            '..',
+            '.',
+            '../..',
+            '/',
+            '/absolute/**/path/*',
+            './explicit/*/relative/path/**',
+            'implicit',
+            'internal',
+            'C:/absolute/windows/path',
+            '../explicit/windows/path',
+            'implicit/windows/*',
+            'with spaces/inside the/path'
+        ]);
+    });
+});
+
 describe('#extractSearchPathsFromIncludes', function (): void {
     this.timeout(10000);
-    it('should not resolve paths from a not absolute / relative pattern', function (): void {
-        const pattern = 'carrots';
-        const options = { include: [pattern] };
-        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes']([rootDirA], options);
-        // Same root directory
-        expect(searchPaths.length).equal(1);
-        expect(searchPaths[0]).equal(rootDirA);
-
-        // Pattern is unchanged
-        expect(options.include.length).equal(1);
-        expect(options.include[0]).equals(pattern);
+    it('should search absolute paths', function (): void {
+        const options = { include: ['/absolute/path/', '/', '/absolute/path/with/**/glob'] };
+        const workspaceRoots = ['/root/A/1', '/root/B/2', '/root/C/3'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals(['/absolute/path', '/', '/absolute/path/with']);
     });
 
-    it('should resolve pattern to path for relative filename', function (): void {
-        const filename = 'carrots';
-        const pattern = `./${filename}`;
-        checkResolvedPathForPattern(pattern, path.join(rootDirA, filename));
+    it('should add . and .. to workspace roots', function (): void {
+        const options = { include: ['.', '..'] };
+        const workspaceRoots = ['/root/A/1', '/root/B/2', '/root/C/3'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals(['/root/A/1', '/root/B/2', '/root/C/3', '/root/A', '/root/B', '/root/C']);
     });
 
-    it('should resolve relative pattern with sub-folders glob', function (): void {
-        const filename = 'carrots';
-        const pattern = `./${filename}/**`;
-        checkResolvedPathForPattern(pattern, path.join(rootDirA, filename));
+    it('should add explicit relative paths to workspace roots', function (): void {
+        const options = { include: ['./sub1', '../sub2', './sub3/with/**/glob', '../sub4/with/**/glob'] };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals([
+            '/root/A/1/sub1',
+            '/root/B/2/sub1',
+            '/root/A/sub2',
+            '/root/B/sub2',
+            '/root/A/1/sub3/with',
+            '/root/B/2/sub3/with',
+            '/root/A/sub4/with',
+            '/root/B/sub4/with'
+        ]);
     });
 
-    it('should resolve absolute path pattern', function (): void {
-        const pattern = `${rootDirA}/carrots`;
-        checkResolvedPathForPattern(pattern, pattern);
+    it('should ignore implicit relative paths and use the workspace roots', function (): void {
+        const options = { include: ['implicit/path/1', 'implicit/path/2', '*/implicit/**/with/globs'] };
+        const workspaceRoots = ['/root/A/1', '/root/B/2', '/root/C/3'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals(workspaceRoots);
+    });
+
+    it('should ignore non-paths', function (): void {
+        const options = { include: ['', '*', '**'] };
+        const workspaceRoots = ['/root/A/1', '/root/B/2', '/root/C/3'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals(workspaceRoots);
+    });
+
+    it('should take the union of mixed inclusion patterns', function (): void {
+        const options = { include: ['/absolute', './explicit', 'implicit', '..', '*'] };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals([
+            '/absolute',
+            '/root/A/1/explicit',
+            '/root/B/2/explicit',
+            '/root/A/1',
+            '/root/B/2',
+            '/root/A',
+            '/root/B',
+        ]);
+    });
+
+    it('should ignore duplicates and resolve alternative formats', function (): void {
+        const options = { include: ['/absolute/.///path/..', '/../..', './.', './double', './double'] };
+        const workspaceRoots = ['/root/A/1'];
+        const searchPaths = ripgrepServer['extractSearchPathsFromIncludes'](workspaceRoots, options);
+        expect(searchPaths).deep.equals([
+            '/absolute',
+            '/',
+            '/root/A/1',
+            '/root/A/1/double',
+        ]);
     });
 });
 
 describe('#addGlobArgs', function (): void {
     this.timeout(10000);
 
-    it('should resolve path to glob - filename', function (): void {
-        [true, false].forEach(excludeFlag => {
-            const excludePrefix = excludeFlag ? '!' : '';
-            const filename = 'carrots';
-            const expected = [
-                `--glob=${excludePrefix}**/${filename}`,
-                `--glob=${excludePrefix}**/${filename}/*`
-            ];
-            const actual = new Set<string>();
-            ripgrepServer['addGlobArgs'](actual, [filename], excludeFlag);
-            expect(expected).to.have.deep.members([...actual]);
-        });
+    it('should preserve absolute paths and add trailing globs where necessary', function (): void {
+        const options = {
+            include: [
+                '/',
+                '/*',
+                '/**',
+                '/absolute1',
+                '/absolute2/*',
+                '/absolute3/**',
+                '/absolute4/*/path',
+                '/absolute5/**/path',
+                '/*/absolute6',
+                '/absolute/*.txt',
+                '/absolute/file.*',
+            ],
+        };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const args = new Set<string>();
+        ripgrepServer['addGlobArgs'](args, options.include, false, workspaceRoots);
+        expect([...args]).deep.equals([
+            '--glob=*/',
+            '--glob=*/**',
+            '--glob=*/*',
+            '--glob=*/absolute1',
+            '--glob=*/absolute1/**',
+            '--glob=*/absolute2/*',
+            '--glob=*/absolute3/**',
+            '--glob=*/absolute4/*/path',
+            '--glob=*/absolute4/*/path/**',
+            '--glob=*/absolute5/**/path',
+            '--glob=*/absolute5/**/path/**',
+            '--glob=*/*/absolute6',
+            '--glob=*/*/absolute6/**',
+            '--glob=*/absolute/*.txt',
+            '--glob=*/absolute/*.txt/**',
+            '--glob=*/absolute/file.*',
+            '--glob=*/absolute/file.*/**',
+        ]);
     });
 
-    it('should resolve path to glob - glob prefixed folder', function (): void {
-        [true, false].forEach(excludeFlag => {
-            const excludePrefix = excludeFlag ? '!' : '';
-            const filename = 'carrots';
-            const inputPath = `**/${filename}/`;
-            const expected = [
-                `--glob=${excludePrefix}**/${filename}/`,
-                `--glob=${excludePrefix}**/${filename}/*`
-            ];
-            const actual = new Set<string>();
-            ripgrepServer['addGlobArgs'](actual, [inputPath], excludeFlag);
-            expect(expected).to.have.deep.members([...actual]);
-        });
+    it('should add . and .. to workspace roots and add trailing globs where necessary', function (): void {
+        const options = {
+            include: [
+                '.',
+                '..',
+            ]
+        };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const args = new Set<string>();
+        ripgrepServer['addGlobArgs'](args, options.include, false, workspaceRoots);
+        expect([...args]).deep.equals([
+            '--glob=*/root/A/1',
+            '--glob=*/root/A/1/**',
+            '--glob=*/root/B/2',
+            '--glob=*/root/B/2/**',
+            '--glob=*/root/A',
+            '--glob=*/root/A/**',
+            '--glob=*/root/B',
+            '--glob=*/root/B/**',
+        ]);
     });
 
-    it('should resolve path to glob - path segment', function (): void {
-        [true, false].forEach(excludeFlag => {
-            const excludePrefix = excludeFlag ? '!' : '';
-            const filename = 'carrots';
-            const inputPath = `/${filename}`;
-            const expected = [
-                `--glob=${excludePrefix}**/${filename}`,
-                `--glob=${excludePrefix}**/${filename}/*`
-            ];
-            const actual = new Set<string>();
-            ripgrepServer['addGlobArgs'](actual, [inputPath], excludeFlag);
-            expect(expected).to.have.deep.members([...actual]);
-        });
+    it('should add explicit relative paths to workspace roots and add trailing globs where necessary', function (): void {
+        const options = {
+            include: [
+                './*',
+                '../**',
+                './relative1',
+                '../relative2',
+                './relative3/*',
+                '../relative4/*',
+                './relative5/**',
+                '../relative6/**',
+                './relative7/*/path',
+                '../relative8/*/path',
+                './relative9/**/path',
+                '../relative10/**/path',
+                './relative11/*.json',
+                '../relative12/*.json',
+                './relative13/file.*',
+                '../relative14/file.*',
+            ]
+        };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const args = new Set<string>();
+        ripgrepServer['addGlobArgs'](args, options.include, false, workspaceRoots);
+        expect([...args]).deep.equals([
+            '--glob=*/root/A/1/*',
+            '--glob=*/root/B/2/*',
+            '--glob=*/root/A/**',
+            '--glob=*/root/B/**',
+            '--glob=*/root/A/1/relative1',
+            '--glob=*/root/A/1/relative1/**',
+            '--glob=*/root/B/2/relative1',
+            '--glob=*/root/B/2/relative1/**',
+            '--glob=*/root/A/relative2',
+            '--glob=*/root/A/relative2/**',
+            '--glob=*/root/B/relative2',
+            '--glob=*/root/B/relative2/**',
+            '--glob=*/root/A/1/relative3/*',
+            '--glob=*/root/B/2/relative3/*',
+            '--glob=*/root/A/relative4/*',
+            '--glob=*/root/B/relative4/*',
+            '--glob=*/root/A/1/relative5/**',
+            '--glob=*/root/B/2/relative5/**',
+            '--glob=*/root/A/relative6/**',
+            '--glob=*/root/B/relative6/**',
+            '--glob=*/root/A/1/relative7/*/path',
+            '--glob=*/root/A/1/relative7/*/path/**',
+            '--glob=*/root/B/2/relative7/*/path',
+            '--glob=*/root/B/2/relative7/*/path/**',
+            '--glob=*/root/A/relative8/*/path',
+            '--glob=*/root/A/relative8/*/path/**',
+            '--glob=*/root/B/relative8/*/path',
+            '--glob=*/root/B/relative8/*/path/**',
+            '--glob=*/root/A/1/relative9/**/path',
+            '--glob=*/root/A/1/relative9/**/path/**',
+            '--glob=*/root/B/2/relative9/**/path',
+            '--glob=*/root/B/2/relative9/**/path/**',
+            '--glob=*/root/A/relative10/**/path',
+            '--glob=*/root/A/relative10/**/path/**',
+            '--glob=*/root/B/relative10/**/path',
+            '--glob=*/root/B/relative10/**/path/**',
+            '--glob=*/root/A/1/relative11/*.json',
+            '--glob=*/root/A/1/relative11/*.json/**',
+            '--glob=*/root/B/2/relative11/*.json',
+            '--glob=*/root/B/2/relative11/*.json/**',
+            '--glob=*/root/A/relative12/*.json',
+            '--glob=*/root/A/relative12/*.json/**',
+            '--glob=*/root/B/relative12/*.json',
+            '--glob=*/root/B/relative12/*.json/**',
+            '--glob=*/root/A/1/relative13/file.*',
+            '--glob=*/root/A/1/relative13/file.*/**',
+            '--glob=*/root/B/2/relative13/file.*',
+            '--glob=*/root/B/2/relative13/file.*/**',
+            '--glob=*/root/A/relative14/file.*',
+            '--glob=*/root/A/relative14/file.*/**',
+            '--glob=*/root/B/relative14/file.*',
+            '--glob=*/root/B/relative14/file.*/**',
+        ]);
     });
 
-    it('should resolve path to glob - already a glob', function (): void {
-        [true, false].forEach(excludeFlag => {
-            const excludePrefix = excludeFlag ? '!' : '';
-            const filename = 'carrots';
-            const inputPath = `${filename}/**/*`;
-            const expected = [
-                `--glob=${excludePrefix}**/${filename}/**/*`,
-            ];
-            const actual = new Set<string>();
-            ripgrepServer['addGlobArgs'](actual, [inputPath], excludeFlag);
-            expect(expected).to.have.deep.members([...actual]);
-        });
+    it('should add initial and trailing globs to implicitly relative paths where necessary', function (): void {
+        const options = {
+            include: [
+                'implicit1',
+                'implicit2/path',
+                'implicit3/*',
+                'implicit4/**',
+                'implicit5/*/path',
+                'implicit6/**/path',
+                'implicit7/*.json',
+                'implicit8/file.*',
+                '*.json',
+                'file.*',
+            ]
+        };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const args = new Set<string>();
+        ripgrepServer['addGlobArgs'](args, options.include, false, workspaceRoots);
+        expect([...args]).deep.equals([
+            '--glob=*/root/A/1/**/implicit1',
+            '--glob=*/root/A/1/**/implicit1/**',
+            '--glob=*/root/B/2/**/implicit1',
+            '--glob=*/root/B/2/**/implicit1/**',
+            '--glob=*/root/A/1/**/implicit2/path',
+            '--glob=*/root/A/1/**/implicit2/path/**',
+            '--glob=*/root/B/2/**/implicit2/path',
+            '--glob=*/root/B/2/**/implicit2/path/**',
+            '--glob=*/root/A/1/**/implicit3/*',
+            '--glob=*/root/B/2/**/implicit3/*',
+            '--glob=*/root/A/1/**/implicit4/**',
+            '--glob=*/root/B/2/**/implicit4/**',
+            '--glob=*/root/A/1/**/implicit5/*/path',
+            '--glob=*/root/A/1/**/implicit5/*/path/**',
+            '--glob=*/root/B/2/**/implicit5/*/path',
+            '--glob=*/root/B/2/**/implicit5/*/path/**',
+            '--glob=*/root/A/1/**/implicit6/**/path',
+            '--glob=*/root/A/1/**/implicit6/**/path/**',
+            '--glob=*/root/B/2/**/implicit6/**/path',
+            '--glob=*/root/B/2/**/implicit6/**/path/**',
+            '--glob=*/root/A/1/**/implicit7/*.json',
+            '--glob=*/root/A/1/**/implicit7/*.json/**',
+            '--glob=*/root/B/2/**/implicit7/*.json',
+            '--glob=*/root/B/2/**/implicit7/*.json/**',
+            '--glob=*/root/A/1/**/implicit8/file.*',
+            '--glob=*/root/A/1/**/implicit8/file.*/**',
+            '--glob=*/root/B/2/**/implicit8/file.*',
+            '--glob=*/root/B/2/**/implicit8/file.*/**',
+            '--glob=*/root/A/1/**/*.json',
+            '--glob=*/root/A/1/**/*.json/**',
+            '--glob=*/root/B/2/**/*.json',
+            '--glob=*/root/B/2/**/*.json/**',
+            '--glob=*/root/A/1/**/file.*',
+            '--glob=*/root/A/1/**/file.*/**',
+            '--glob=*/root/B/2/**/file.*',
+            '--glob=*/root/B/2/**/file.*/**',
+        ]);
     });
 
-    it('should resolve path to glob - path segment glob suffixed', function (): void {
-        [true, false].forEach(excludeFlag => {
-            const excludePrefix = excludeFlag ? '!' : '';
-            const filename = 'carrots';
-            const inputPath = `/${filename}/**/*`;
-            const expected = [
-                `--glob=${excludePrefix}**/${filename}/**/*`,
-            ];
-            const actual = new Set<string>();
-            ripgrepServer['addGlobArgs'](actual, [inputPath], excludeFlag);
-            expect(expected).to.have.deep.members([...actual]);
-        });
+    it('should handle explicit globs', function (): void {
+        const options = {
+            include: [
+                '*',
+                '**',
+                '*/*',
+                '*/path1',
+                '*/path2/*',
+                '*/path3/**',
+                '**/path4',
+                '**/path5/*',
+                '**/path6/**',
+                '*/*.json1',
+                '**/*.json2',
+                '*/file1.*',
+                '**/file2.*',
+            ]
+        };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const args = new Set<string>();
+        ripgrepServer['addGlobArgs'](args, options.include, false, workspaceRoots);
+        expect([...args]).deep.equals([
+            '--glob=*/root/A/1/*',
+            '--glob=*/root/B/2/*',
+            '--glob=*/root/A/1/**',
+            '--glob=*/root/B/2/**',
+            '--glob=*/root/A/1/*/*',
+            '--glob=*/root/B/2/*/*',
+            '--glob=*/root/A/1/*/path1',
+            '--glob=*/root/A/1/*/path1/**',
+            '--glob=*/root/B/2/*/path1',
+            '--glob=*/root/B/2/*/path1/**',
+            '--glob=*/root/A/1/*/path2/*',
+            '--glob=*/root/B/2/*/path2/*',
+            '--glob=*/root/A/1/*/path3/**',
+            '--glob=*/root/B/2/*/path3/**',
+            '--glob=*/root/A/1/**/path4',
+            '--glob=*/root/A/1/**/path4/**',
+            '--glob=*/root/B/2/**/path4',
+            '--glob=*/root/B/2/**/path4/**',
+            '--glob=*/root/A/1/**/path5/*',
+            '--glob=*/root/B/2/**/path5/*',
+            '--glob=*/root/A/1/**/path6/**',
+            '--glob=*/root/B/2/**/path6/**',
+            '--glob=*/root/A/1/*/*.json1',
+            '--glob=*/root/A/1/*/*.json1/**',
+            '--glob=*/root/B/2/*/*.json1',
+            '--glob=*/root/B/2/*/*.json1/**',
+            '--glob=*/root/A/1/**/*.json2',
+            '--glob=*/root/A/1/**/*.json2/**',
+            '--glob=*/root/B/2/**/*.json2',
+            '--glob=*/root/B/2/**/*.json2/**',
+            '--glob=*/root/A/1/*/file1.*',
+            '--glob=*/root/A/1/*/file1.*/**',
+            '--glob=*/root/B/2/*/file1.*',
+            '--glob=*/root/B/2/*/file1.*/**',
+            '--glob=*/root/A/1/**/file2.*',
+            '--glob=*/root/A/1/**/file2.*/**',
+            '--glob=*/root/B/2/**/file2.*',
+            '--glob=*/root/B/2/**/file2.*/**',
+        ]);
+    });
+
+    it('should handle exclusions', function (): void {
+        const options = {
+            exclude: [
+                '/absolute/path',
+                './explicit/path',
+                'implicit/path'
+            ],
+        };
+        const workspaceRoots = ['/root/A/1', '/root/B/2'];
+        const args = new Set<string>();
+        ripgrepServer['addGlobArgs'](args, options.exclude, true, workspaceRoots);
+        expect([...args]).deep.equals([
+            '--glob=!*/absolute/path',
+            '--glob=!*/absolute/path/**',
+            '--glob=!*/root/A/1/explicit/path',
+            '--glob=!*/root/A/1/explicit/path/**',
+            '--glob=!*/root/B/2/explicit/path',
+            '--glob=!*/root/B/2/explicit/path/**',
+            '--glob=!*/root/A/1/**/implicit/path',
+            '--glob=!*/root/A/1/**/implicit/path/**',
+            '--glob=!*/root/B/2/**/implicit/path',
+            '--glob=!*/root/B/2/**/implicit/path/**',
+        ]);
     });
 });
-
-function checkResolvedPathForPattern(pattern: string, expectedPath: string): void {
-    const options = { include: [pattern] };
-    const searchPaths = ripgrepServer['extractSearchPathsFromIncludes']([rootDirA], options);
-    expect(searchPaths.length).equal(1, 'searchPath result should contain exactly one element');
-    expect(options.include.length).equals(0, 'options.include should be empty');
-    expect(searchPaths[0]).equal(path.normalize(expectedPath));
-}

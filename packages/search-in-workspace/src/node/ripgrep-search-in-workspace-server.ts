@@ -14,7 +14,6 @@
  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
  ********************************************************************************/
 
-import * as fs from '@theia/core/shared/fs-extra';
 import * as path from 'path';
 import { ILogger } from '@theia/core';
 import { RawProcess, RawProcessFactory, RawProcessOptions } from '@theia/process/lib/node';
@@ -24,6 +23,7 @@ import { inject, injectable } from '@theia/core/shared/inversify';
 import { SearchInWorkspaceServer, SearchInWorkspaceOptions, SearchInWorkspaceResult, SearchInWorkspaceClient, LinePreview } from '../common/search-in-workspace-interface';
 
 export const RgPath = Symbol('RgPath');
+const GLOB_SPECIAL_CHARS = /[?*!{}]/;
 
 /**
  * Typing for ripgrep's arbitrary data object:
@@ -95,7 +95,7 @@ export class RipgrepSearchInWorkspaceServer implements SearchInWorkspaceServer {
         this.client = client;
     }
 
-    protected getArgs(options?: SearchInWorkspaceOptions): string[] {
+    protected getArgs(options?: SearchInWorkspaceOptions, workspaceRoots: string[] = []): string[] {
         const args = new Set<string>();
 
         args.add('--hidden');
@@ -117,11 +117,11 @@ export class RipgrepSearchInWorkspaceServer implements SearchInWorkspaceServer {
         }
 
         if (options?.include) {
-            this.addGlobArgs(args, options.include, false);
+            this.addGlobArgs(args, options.include, false, workspaceRoots);
         }
 
         if (options?.exclude) {
-            this.addGlobArgs(args, options.exclude, true);
+            this.addGlobArgs(args, options.exclude, true, workspaceRoots);
         }
 
         if (options?.useRegExp || options?.matchWholeWord) {
@@ -136,60 +136,48 @@ export class RipgrepSearchInWorkspaceServer implements SearchInWorkspaceServer {
 
     /**
      * Add glob patterns to ripgrep's arguments
-     * @param args ripgrep set of arguments
+     * @param args set of arguments to be mutated and passed to ripgrep
      * @param patterns patterns to include as globs
      * @param exclude whether to negate the glob pattern or not
+     * @param workspaceRoots for constraining the search scope when the search paths include paths other than workspaceRoots
      */
-    protected addGlobArgs(args: Set<string>, patterns: string[], exclude: boolean = false): void {
-        const sanitizedPatterns = patterns.map(pattern => pattern.trim()).filter(pattern => pattern.length > 0);
-        for (let pattern of sanitizedPatterns) {
-            // make sure the pattern always starts with `**/`
-            if (pattern.startsWith('/')) {
-                pattern = '**' + pattern;
-            } else if (!pattern.startsWith('**/')) {
-                pattern = '**/' + pattern;
-            }
-            // add the exclusion prefix
-            if (exclude) {
-                pattern = '!' + pattern;
-            }
-            args.add(`--glob=${pattern}`);
-            // add a generic glob cli argument entry to include files inside a given directory
-            if (!pattern.endsWith('*')) {
-                // ensure the new pattern ends with `/*`
-                pattern += pattern.endsWith('/') ? '*' : '/*';
-                args.add(`--glob=${pattern}`);
-            }
-        }
-    }
-
-    /**
-     * Transforms relative patterns to absolute paths, one for each given search path.
-     * The resulting paths are not validated in the file system as the pattern keeps glob information.
-     *
-     * @returns The resulting list may be larger than the received patterns as a relative pattern may
-     * resolve to multiple absolute patterns up to the number of search paths.
-     */
-    protected replaceRelativeToAbsolute(roots: string[], patterns: string[] = []): string[] {
-        const expandedPatterns = new Set<string>();
-        for (const pattern of patterns) {
-            if (this.isPatternRelative(pattern)) {
-                // create new patterns using the absolute form for each root
-                for (const root of roots) {
-                    expandedPatterns.add(path.resolve(root, pattern));
+    protected addGlobArgs(args: Set<string>, patterns: string[], exclude: boolean = false, workspaceRoots: string[] = []): void {
+        const prefix = exclude ? '!' : '';
+        for (let pattern of patterns) {
+            pattern = this.normalizePath(pattern);
+            if (path.isAbsolute(pattern)) {
+                // Ripgrep usage note:
+                // Glob patterns without special glob characters are traversed, not searched.
+                // Patterns that are absolute paths are appended by ripgrep to all search paths.
+                // A * before the pattern prevents both behaviors and allows absolute path globs to be tested normally against file paths.
+                args.add(`--glob=${prefix}*${pattern}`);
+                if (!pattern.endsWith('/*') && !pattern.endsWith('/**')) {
+                    args.add(`--glob=${prefix}*${path.resolve(pattern, '**')}`);
                 }
-            } else {
-                expandedPatterns.add(pattern);
+            } else if (this.pathIsExplicitlyRelative(pattern) || pattern === '*' || pattern.startsWith('*/') || pattern === '**' || pattern.startsWith('**/')) {
+                for (const workspaceRoot of workspaceRoots) {
+                    args.add(`--glob=${prefix}*${path.resolve(workspaceRoot, pattern)}`);
+                    if (pattern !== '*' && pattern !== '**' && !pattern.endsWith('/*') && !pattern.endsWith('/**')) {
+                        args.add(`--glob=${prefix}*${path.resolve(workspaceRoot, pattern, '**')}`);
+                    }
+                }
+            } else { // implicitly relative cases
+                for (const workspaceRoot of workspaceRoots) {
+                    args.add(`--glob=${prefix}*${path.resolve(workspaceRoot, '**', pattern)}`);
+                    if (!pattern.endsWith('/*') && !pattern.endsWith('/**')) {
+                        args.add(`--glob=${prefix}*${path.resolve(workspaceRoot, '**', pattern, '**')}`);
+                    }
+                }
             }
         }
-        return Array.from(expandedPatterns);
     }
 
     /**
-     * Tests if the pattern is relative and should/can be made absolute.
+     * Test if pattern is a definite location relative to the workspace roots.
      */
-    protected isPatternRelative(pattern: string): boolean {
-        return pattern.replace(/\\/g, '/').startsWith('./');
+    protected pathIsExplicitlyRelative(pattern: string): boolean {
+        pattern = pattern.replace(/\\/g, '/');
+        return pattern.startsWith('./') || pattern.startsWith('../') || pattern === '.' || pattern === '..';
     }
 
     /**
@@ -213,9 +201,7 @@ export class RipgrepSearchInWorkspaceServer implements SearchInWorkspaceServer {
         // If there are absolute paths in `include` we will remove them and use
         // those as paths to search from.
         const searchPaths = this.extractSearchPathsFromIncludes(rootPaths, options);
-        options.include = this.replaceRelativeToAbsolute(searchPaths, options.include);
-        options.exclude = this.replaceRelativeToAbsolute(searchPaths, options.exclude);
-        const rgArgs = this.getArgs(options);
+        const rgArgs = this.getArgs(options, rootPaths);
         // If we use matchWholeWord we use regExp internally, so we need
         // to escape regexp characters if we actually not set regexp true in UI.
         if (options?.matchWholeWord && !options.useRegExp) {
@@ -373,62 +359,56 @@ export class RipgrepSearchInWorkspaceServer implements SearchInWorkspaceServer {
     }
 
     /**
-     * The default search paths are set to be the root paths associated to a workspace
-     * however the search scope can be further refined with the include paths available in the search options.
-     * This method will replace the searching paths to the ones specified in the 'include' options but as long
-     * as the 'include' paths can be successfully validated as existing.
-     *
-     * Therefore the returned array of paths can be either the workspace root paths or a set of validated paths
-     * derived from the include options which can be used to perform the search.
-     *
-     * Any pattern that resulted in a valid search path will be removed from the 'include' list as it is
-     * provided as an equivalent search path instead.
+     * Limit the search scope as narrowly as possible to speed up searches.
      */
-    protected extractSearchPathsFromIncludes(rootPaths: string[], options: SearchInWorkspaceOptions): string[] {
-        if (!options.include) {
-            return rootPaths;
-        }
-        const resolvedPaths = new Set<string>();
-        options.include = options.include.filter(pattern => {
-            let keep = true;
-            for (const root of rootPaths) {
-                const absolutePath = this.getAbsolutePathFromPattern(root, pattern);
-                // undefined means the pattern cannot be converted into an absolute path
-                if (absolutePath) {
-                    resolvedPaths.add(absolutePath);
-                    keep = false;
+    protected extractSearchPathsFromIncludes(workspaceRoots: string[], options: SearchInWorkspaceOptions): string[] {
+        const patterns = options.include ?? [];
+        const searchPaths = new Set<string>();
+        for (let pattern of patterns) {
+            pattern = this.normalizePath(pattern);
+            if (!pattern) {
+                continue;
+            }
+
+            const firstGlobChar = pattern.search(GLOB_SPECIAL_CHARS);
+            const lastSeparatorBeforeGlobChar = pattern.slice(0, firstGlobChar).lastIndexOf(path.sep);
+            if (~firstGlobChar && ~lastSeparatorBeforeGlobChar) {
+                pattern = pattern.slice(0, lastSeparatorBeforeGlobChar);
+            }
+
+            if (path.isAbsolute(pattern)) {
+                searchPaths.add(pattern);
+            } else if (this.pathIsExplicitlyRelative(pattern)) {
+                for (const workspaceRoot of workspaceRoots) {
+                    searchPaths.add(path.resolve(workspaceRoot, pattern));
+                }
+            } else { // not absolute, not explicit -> implicitly relative path
+                for (const workspaceRoot of workspaceRoots) {
+                    searchPaths.add(workspaceRoot);
                 }
             }
-            return keep;
-        });
-        return resolvedPaths.size > 0
-            ? Array.from(resolvedPaths)
-            : rootPaths;
+        }
+        return (searchPaths.size) ? [...searchPaths] : workspaceRoots;
     }
 
-    /**
-     * Transform include/exclude option patterns from relative patterns to absolute patterns.
-     * E.g. './abc/foo.*' to '${root}/abc/foo.*', the transformation does not validate the
-     * pattern against the file system as glob suffixes remain.
-     *
-     * @returns undefined if the pattern cannot be converted into an absolute path.
-     */
-    protected getAbsolutePathFromPattern(root: string, pattern: string): string | undefined {
+    private normalizePath(pattern: string): string {
+        pattern = pattern.trim();
         pattern = pattern.replace(/\\/g, '/');
-        // The pattern is not referring to a single file or folder, i.e. not to be converted
-        if (!path.isAbsolute(pattern) && !pattern.startsWith('./')) {
-            return undefined;
+        if (pattern === '') {
+            return pattern; // otherwise normalizes to '.'
         }
-        // remove the `/**` suffix if present
-        if (pattern.endsWith('/**')) {
-            pattern = pattern.substr(0, pattern.length - 3);
+
+        const relativePrefix = pattern.startsWith('./') ? './' : ''; // otherwise gets dropped by path.normalize
+        pattern = path.normalize(pattern);
+        if (pattern !== '.' && pattern !== '..' && !pattern.startsWith('../')) {
+            pattern = relativePrefix + pattern;
         }
-        // if `pattern` is absolute then `root` will be ignored by `path.resolve()`
-        const targetPath = path.resolve(root, pattern);
-        if (fs.existsSync(targetPath)) {
-            return targetPath;
+
+        // No trailing slash
+        if (pattern.endsWith('/') && pattern !== '/') {
+            pattern = pattern.slice(0, -1);
         }
-        return undefined;
+        return pattern;
     }
 
     /**
