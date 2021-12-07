@@ -29,8 +29,12 @@
     "watch": "theiaext watch"
   },
   "dependencies": {
-    "@types/bent": "^7.0.1",
-    "bent": "^7.1.0",
+    "https-proxy-agent": "^5.0.0",
+    "node-fetch": "^2.6.0",
+    "proxy-from-env": "^1.1.0",
     "semver": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/proxy-from-env": "^1.0.1"
   }
 }

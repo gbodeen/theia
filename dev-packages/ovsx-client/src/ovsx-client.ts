@@ -14,7 +14,9 @@
  * SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
  ********************************************************************************/
 
-import * as bent from 'bent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import fetch, { RequestInit, Response } from 'node-fetch';
+import { getProxyForUrl } from 'proxy-from-env';
 import * as semver from 'semver';
 import {
     VSXAllVersions,
@@ -27,8 +29,17 @@ import {
     VSXSearchResult
 } from './ovsx-types';
 
-const fetchText = bent('GET', 'string', 200);
-const fetchJson = bent('GET', { 'Accept': 'application/json' }, 'json', 200);
+/**
+ * Follow HTTP(S)_PROXY, ALL_PROXY and NO_PROXY environment variables.
+ */
+export function xfetch(url: string, options?: RequestInit): Promise<Response> {
+    const proxiedOptions: RequestInit = { ...options };
+    const proxy = getProxyForUrl(url);
+    if (!proxiedOptions.agent && proxy !== '') {
+        proxiedOptions.agent = new HttpsProxyAgent(proxy);
+    }
+    return fetch(url, proxiedOptions);
+}
 
 export interface OVSXClientOptions {
     apiVersion: string
@@ -99,12 +110,14 @@ export class OVSXClient {
         throw new Error(`Extension with id ${id} not found at ${apiUri}`);
     }
 
-    protected fetchJson<R>(url: string): Promise<R> {
-        return fetchJson(url) as Promise<R>;
+    protected async fetchJson<R>(url: string): Promise<R> {
+        const res = await xfetch(url);
+        return res.json() as Promise<R>;
     }
 
-    fetchText(url: string): Promise<string> {
-        return fetchText(url);
+    async fetchText(url: string): Promise<string> {
+        const res = await xfetch(url);
+        return res.text();
     }
 
     /**

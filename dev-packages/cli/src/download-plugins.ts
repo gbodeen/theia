@@ -23,14 +23,12 @@ declare global {
     }
 }
 
-import { OVSXClient } from '@theia/ovsx-client/lib/ovsx-client';
+import { OVSXClient, xfetch } from '@theia/ovsx-client/lib/ovsx-client';
+import { Response } from '@theia/ovsx-client/lib/ovsx-types';
 import { green, red, yellow } from 'colors/safe';
 import * as decompress from 'decompress';
 import { createWriteStream, promises as fs } from 'fs';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import fetch, { RequestInit, Response } from 'node-fetch';
 import * as path from 'path';
-import { getProxyForUrl } from 'proxy-from-env';
 import * as stream from 'stream';
 import * as temp from 'temp';
 import { promisify } from 'util';
@@ -240,18 +238,6 @@ async function downloadPluginAsync(failures: string[], plugin: string, pluginUrl
  */
 async function isDownloaded(filePath: string): Promise<boolean> {
     return fs.stat(filePath).then(() => true, () => false);
-}
-
-/**
- * Follow HTTP(S)_PROXY, ALL_PROXY and NO_PROXY environment variables.
- */
-export function xfetch(url: string, options?: RequestInit): Promise<Response> {
-    const proxiedOptions: RequestInit = { ...options };
-    const proxy = getProxyForUrl(url);
-    if (!proxiedOptions.agent && proxy !== '') {
-        proxiedOptions.agent = new HttpsProxyAgent(proxy);
-    }
-    return fetch(url, proxiedOptions);
 }
 
 /**
