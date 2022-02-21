@@ -173,13 +173,15 @@ export class ApplicationPackageManager {
         }
         const currentRange: string | undefined = appPackageJson.devDependencies.electron;
         if (!currentRange || semver.compare(semver.minVersion(currentRange), semver.minVersion(expectedRange)) < 0) {
+            console.warn('Dependencies were going to be forcibly updated except we have turned that off');
             // Update the range with the recommended one and write it on disk.
-            appPackageJson.devDependencies = this.insertAlphabetically(appPackageJson.devDependencies, 'electron', expectedRange);
-            await fs.writeJSON(appPackageJsonPath, appPackageJson, { spaces: 2 });
-            throw new AbortError('Updated dependencies, please run "install" again');
+            // appPackageJson.devDependencies = this.insertAlphabetically(appPackageJson.devDependencies, 'electron', expectedRange);
+            // await fs.writeJSON(appPackageJsonPath, appPackageJson, { spaces: 2 });
+            // throw new AbortError('Updated dependencies, please run "install" again');
         }
         if (!theiaElectron.electronVersion || !semver.satisfies(theiaElectron.electronVersion, currentRange)) {
-            throw new AbortError('Dependencies are out of sync, please run "install" again');
+            console.warn('Electron dependencies are out of sync.');
+            // throw new AbortError('Dependencies are out of sync, please run "install" again');
         }
         await ffmpeg.replaceFfmpeg();
         await ffmpeg.checkFfmpeg();
